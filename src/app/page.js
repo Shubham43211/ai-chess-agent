@@ -18,27 +18,60 @@ export default function ChessGame() {
 
   const moveEndRef = useRef(null);
 
-  // Wasm Engine Initialization
+  // Wasm Engine Initialization (C++ engine compiled to engine.js + engine.wasm)
   useEffect(() => {
-    if (window.Module && typeof window.Module.ccall === 'function') {
-      setEngineReady(true);
+    let cancelled = false;
+
+    const isEngineCallable = () =>
+      typeof window !== 'undefined' &&
+      window.Module &&
+      typeof window.Module.ccall === 'function';
+
+    const markReady = () => {
+      if (!cancelled) {
+        setEngineReady(true);
+        setGameStatus((status) => (status === "Loading Engine..." ? "White to move" : status));
+      }
+    };
+
+    if (isEngineCallable()) {
+      markReady();
       return;
     }
 
+    const previousModule = window.Module || {};
     window.Module = {
-      ...window.Module,
+      ...previousModule,
+      locateFile: (path) => `/${path}`,
       onRuntimeInitialized: () => {
-        setEngineReady(true);
-        setGameStatus("White to move");
-      }
+        if (typeof previousModule.onRuntimeInitialized === 'function') {
+          previousModule.onRuntimeInitialized();
+        }
+        markReady();
+      },
     };
 
     if (!document.querySelector('script[src="/engine.js"]')) {
       const script = document.createElement('script');
       script.src = "/engine.js";
       script.async = true;
+      script.onerror = () => {
+        console.error("Failed to load /engine.js — AI will use a random-move fallback.");
+      };
       document.body.appendChild(script);
     }
+
+    const poll = setInterval(() => {
+      if (isEngineCallable()) {
+        markReady();
+        clearInterval(poll);
+      }
+    }, 150);
+
+    return () => {
+      cancelled = true;
+      clearInterval(poll);
+    };
   }, []);
 
   // Auto-scroll move history
@@ -153,9 +186,33 @@ export default function ChessGame() {
     }, 50);
   }, [updateGameStatus, updateMoveHistory]);
 
-  // High-performance Click Handler routing
-  const handleSquareClick = useCallback((square) => {
-    if (isThinking || game.isGameOver()) return;
+  const applyPlayerMove = useCallback((from, to) => {
+    if (isThinking || game.isGameOver() || !from || !to) return false;
+
+    const gameCopy = new Chess(game.fen());
+    try {
+      const moveResult = gameCopy.move({
+        from,
+        to,
+        promotion: 'q',
+      });
+
+      if (!moveResult) return false;
+
+      setGame(gameCopy);
+      updateMoveHistory(moveResult.san);
+      updateGameStatus(gameCopy);
+      setSelectedSquare(null);
+      setOptionSquares({});
+      requestAIMove(gameCopy);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [game, isThinking, requestAIMove, updateGameStatus, updateMoveHistory]);
+
+  const handleSquareClick = useCallback(({ square }) => {
+    if (isThinking || game.isGameOver() || !square) return;
 
     const clickedPiece = game.get(square);
 
@@ -179,30 +236,16 @@ export default function ChessGame() {
       return;
     }
 
-    const gameCopy = new Chess(game.fen());
-    try {
-      const moveResult = gameCopy.move({
-        from: selectedSquare,
-        to: square,
-        promotion: 'q',
-      });
-
-      if (moveResult) {
-        setGame(gameCopy);
-        updateMoveHistory(moveResult.san);
-        updateGameStatus(gameCopy);
-        setSelectedSquare(null);
-        setOptionSquares({});
-        requestAIMove(gameCopy);
-      } else {
-        setSelectedSquare(null);
-        setOptionSquares({});
-      }
-    } catch {
+    if (!applyPlayerMove(selectedSquare, square)) {
       setSelectedSquare(null);
       setOptionSquares({});
     }
-  }, [game, isThinking, selectedSquare, requestAIMove, showMoveOptions, updateGameStatus, updateMoveHistory]);
+  }, [applyPlayerMove, game, isThinking, selectedSquare, showMoveOptions]);
+
+  const handlePieceDrop = useCallback(({ sourceSquare, targetSquare }) => {
+    if (!targetSquare) return false;
+    return applyPlayerMove(sourceSquare, targetSquare);
+  }, [applyPlayerMove]);
 
   // FIXED: Button Handlers
   const toggleFlip = useCallback(() => {
@@ -266,16 +309,22 @@ export default function ChessGame() {
 
           <div className="w-full shadow-2xl border-x border-[#2b2925] bg-[#2b2925]">
             <Chessboard
-              position={game.fen()}
-              arePiecesDraggable={true}
-              onPieceDrop={(source,target) => handlePieceDrop(source,target)}
-              onSquareClick={handleSquareClick}
-              onPieceClick={(_, square) => handleSquareClick(square)}
-              customSquareStyles={optionSquares}
-              boardOrientation={orientation}
-              customDarkSquareStyle={{ backgroundColor: '#739552' }}
-              customLightSquareStyle={{ backgroundColor: '#ebecd0' }}
-              animationDuration={150}
+              options={{
+                position: game.fen(),
+                allowDragging: !isThinking && !game.isGameOver(),
+                onPieceDrop: handlePieceDrop,
+                onSquareClick: handleSquareClick,
+                squareStyles: optionSquares,
+                boardOrientation: orientation,
+                darkSquareStyle: { backgroundColor: '#739552' },
+                lightSquareStyle: { backgroundColor: '#ebecd0' },
+                animationDurationInMs: 150,
+                canDragPiece: ({ square }) => {
+                  if (isThinking || game.isGameOver() || !square) return false;
+                  const piece = game.get(square);
+                  return Boolean(piece && piece.color === game.turn());
+                },
+              }}
             />
           </div>
 
