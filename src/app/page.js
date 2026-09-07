@@ -4,6 +4,147 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Chess } from 'chess.js';
 import { Chessboard } from 'react-chessboard';
 
+const PIECE_VALUES = {
+  p: 100,
+  n: 320,
+  b: 330,
+  r: 500,
+  q: 900,
+  k: 20_000,
+};
+
+const CHECKMATE_SCORE = 1_000_000;
+const SEARCH_TIME_LIMIT_MS = 1_200;
+
+function getPositionalBonus(piece, row, column) {
+  const rank = piece.color === 'w' ? 7 - row : row;
+  const centerDistance = Math.abs(3.5 - column) + Math.abs(3.5 - rank);
+  const centerBonus = Math.max(0, 4 - centerDistance) * 5;
+
+  switch (piece.type) {
+    case 'p':
+      return rank * 10 + centerBonus;
+    case 'n':
+    case 'b':
+      return centerBonus * 2;
+    case 'r':
+      return rank * 2;
+    case 'q':
+      return centerBonus;
+    case 'k':
+      return rank < 2 ? 18 : -centerBonus;
+    default:
+      return 0;
+  }
+}
+
+function evaluatePosition(position) {
+  if (position.isCheckmate()) {
+    return position.turn() === 'w' ? -CHECKMATE_SCORE : CHECKMATE_SCORE;
+  }
+
+  if (position.isDraw()) return 0;
+
+  let score = 0;
+  position.board().forEach((rank, row) => {
+    rank.forEach((piece, column) => {
+      if (!piece) return;
+
+      const pieceScore = PIECE_VALUES[piece.type] + getPositionalBonus(piece, row, column);
+      score += piece.color === 'w' ? pieceScore : -pieceScore;
+    });
+  });
+
+  if (position.inCheck()) {
+    score += position.turn() === 'w' ? -35 : 35;
+  }
+
+  return score;
+}
+
+function scoreMove(move) {
+  let score = 0;
+
+  if (move.captured) score += 10 * PIECE_VALUES[move.captured] - PIECE_VALUES[move.piece];
+  if (move.promotion) score += PIECE_VALUES[move.promotion] - PIECE_VALUES.p;
+  if (move.san.includes('+')) score += 40;
+  if (move.san.includes('#')) score += CHECKMATE_SCORE;
+
+  return score;
+}
+
+function orderedMoves(position) {
+  return position.moves({ verbose: true }).sort((a, b) => scoreMove(b) - scoreMove(a));
+}
+
+function minimax(position, depth, alpha, beta, searchState) {
+  if (Date.now() >= searchState.deadline) {
+    searchState.timedOut = true;
+    return evaluatePosition(position);
+  }
+
+  if (depth === 0 || position.isGameOver()) {
+    return evaluatePosition(position);
+  }
+
+  const isWhiteTurn = position.turn() === 'w';
+  let bestScore = isWhiteTurn ? -Infinity : Infinity;
+
+  for (const move of orderedMoves(position)) {
+    position.move(move);
+    const score = minimax(position, depth - 1, alpha, beta, searchState);
+    position.undo();
+
+    if (searchState.timedOut) return bestScore;
+
+    if (isWhiteTurn) {
+      bestScore = Math.max(bestScore, score);
+      alpha = Math.max(alpha, score);
+    } else {
+      bestScore = Math.min(bestScore, score);
+      beta = Math.min(beta, score);
+    }
+
+    if (beta <= alpha) break;
+  }
+
+  return bestScore;
+}
+
+function findBestComputerMove(currentGame) {
+  const position = new Chess(currentGame.fen());
+  const legalMoves = orderedMoves(position);
+  if (legalMoves.length === 0) return null;
+
+  let bestMove = legalMoves[0];
+  const maxDepth = legalMoves.length <= 14 ? 4 : 3;
+  const deadline = Date.now() + SEARCH_TIME_LIMIT_MS;
+
+  for (let depth = 1; depth <= maxDepth; depth += 1) {
+    const searchState = { deadline, timedOut: false };
+    let bestScore = Infinity;
+    let depthBestMove = bestMove;
+
+    for (const move of legalMoves) {
+      position.move(move);
+      const score = minimax(position, depth - 1, -Infinity, Infinity, searchState);
+      position.undo();
+
+      if (searchState.timedOut) break;
+
+      if (score < bestScore) {
+        bestScore = score;
+        depthBestMove = move;
+      }
+    }
+
+    if (searchState.timedOut) break;
+    bestMove = depthBestMove;
+  }
+
+  return bestMove;
+}
+
 export default function ChessGame() {
   const [game, setGame] = useState(new Chess());
   const [engineReady, setEngineReady] = useState(false);
@@ -58,7 +199,7 @@ export default function ChessGame() {
       script.src = "/engine.js";
       script.async = true;
       script.onerror = () => {
-        console.error("Failed to load /engine.js — AI will use a random-move fallback.");
+        console.error("Failed to load /engine.js — the built-in legal-move search remains available.");
       };
       document.body.appendChild(script);
     }
@@ -150,36 +291,8 @@ export default function ChessGame() {
 
     aiMoveTimeoutRef.current = window.setTimeout(() => {
       try {
-        const legalMoves = currentGame.moves({ verbose: true });
-        if (legalMoves.length === 0) return;
-
-        let selectedMove = legalMoves[Math.floor(Math.random() * legalMoves.length)];
-
-        if (window.Module && window.Module.ccall) {
-          try {
-            const bestMoveUCI = window.Module.ccall(
-              'get_best_move_wasm',
-              'string',
-              ['string'],
-              [currentGame.fen()]
-            );
-
-            if (bestMoveUCI && bestMoveUCI.length >= 4) {
-              const from = bestMoveUCI.substring(0, 2);
-              const to = bestMoveUCI.substring(2, 4);
-              const promotion = bestMoveUCI.length > 4 ? bestMoveUCI[4].toLowerCase() : undefined;
-              const engineMove = legalMoves.find((move) =>
-                move.from === from &&
-                move.to === to &&
-                (!move.promotion || move.promotion === promotion)
-              );
-
-              if (engineMove) selectedMove = engineMove;
-            }
-          } catch {
-            // Use the legal-move fallback when the WebAssembly engine is unavailable.
-          }
-        }
+        const selectedMove = findBestComputerMove(currentGame);
+        if (!selectedMove) return;
 
         const gameCopy = new Chess(currentGame.fen());
         const moveResult = gameCopy.move(selectedMove);
@@ -315,7 +428,7 @@ export default function ChessGame() {
                   <span className="font-bold text-white text-sm">AlphaEngine Wasm</span>
                   <span className="text-[11px] bg-[#3b3834] text-zinc-300 px-1.5 rounded font-mono">1850</span>
                 </div>
-                <div className="text-[11px] text-zinc-400">Bitboard • Negamax α-β</div>
+                <div className="text-[11px] text-zinc-400">Legal alpha-beta search • 3–4 ply</div>
               </div>
             </div>
             {isThinking && (
@@ -395,12 +508,12 @@ export default function ChessGame() {
               <span className="text-[#81b64c] font-bold">Pro Click-to-Move</span>
             </div>
             <div className="flex justify-between">
-              <span>Performance:</span>
-              <span className="text-zinc-200">React useMemo Optimized</span>
+              <span>Search:</span>
+              <span className="text-zinc-200">Alpha-beta • 3–4 ply</span>
             </div>
             <div className="flex justify-between">
               <span>Engine Status:</span>
-              <span className="text-zinc-200">WebAssembly Active</span>
+              <span className="text-zinc-200">{engineReady ? 'Wasm + legal search' : 'Legal search active'}</span>
             </div>
           </div>
 
