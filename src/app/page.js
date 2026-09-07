@@ -17,6 +17,8 @@ export default function ChessGame() {
   const [optionSquares, setOptionSquares] = useState({});
 
   const moveEndRef = useRef(null);
+  const aiMoveTimeoutRef = useRef(null);
+  const isThinkingRef = useRef(false);
 
   // Wasm Engine Initialization (C++ engine compiled to engine.js + engine.wasm)
   useEffect(() => {
@@ -93,13 +95,13 @@ export default function ChessGame() {
 
   const updateMoveHistory = useCallback((sanMove) => {
     setMoveHistory((prev) => {
-      const history = [...prev];
-      if (history.length === 0 || history[history.length - 1].black) {
-        history.push({ white: sanMove, black: null });
-      } else {
-        history[history.length - 1].black = sanMove;
+      const lastMove = prev[prev.length - 1];
+
+      if (!lastMove || lastMove.black) {
+        return [...prev, { white: sanMove, black: null }];
       }
-      return history;
+
+      return [...prev.slice(0, -1), { ...lastMove, black: sanMove }];
     });
   }, []);
 
@@ -140,54 +142,65 @@ export default function ChessGame() {
 
   // Background AI Execution
   const requestAIMove = useCallback((currentGame) => {
-    if (currentGame.isGameOver()) return;
+    if (currentGame.isGameOver() || isThinkingRef.current) return;
 
+    isThinkingRef.current = true;
     setIsThinking(true);
     setGameStatus("AI is evaluating tree...");
 
-    setTimeout(() => {
+    aiMoveTimeoutRef.current = window.setTimeout(() => {
       try {
-        if (!window.Module || !window.Module.ccall) {
-          const legalMoves = currentGame.moves({ verbose: true });
-          if (legalMoves.length > 0) {
-            const fallbackMove = legalMoves[Math.floor(Math.random() * legalMoves.length)];
-            const fallbackGame = new Chess(currentGame.fen());
-            fallbackGame.move(fallbackMove);
-            setGame(fallbackGame);
-            updateMoveHistory(fallbackMove.san);
-            updateGameStatus(fallbackGame);
+        const legalMoves = currentGame.moves({ verbose: true });
+        if (legalMoves.length === 0) return;
+
+        let selectedMove = legalMoves[Math.floor(Math.random() * legalMoves.length)];
+
+        if (window.Module && window.Module.ccall) {
+          try {
+            const bestMoveUCI = window.Module.ccall(
+              'get_best_move_wasm',
+              'string',
+              ['string'],
+              [currentGame.fen()]
+            );
+
+            if (bestMoveUCI && bestMoveUCI.length >= 4) {
+              const from = bestMoveUCI.substring(0, 2);
+              const to = bestMoveUCI.substring(2, 4);
+              const promotion = bestMoveUCI.length > 4 ? bestMoveUCI[4].toLowerCase() : undefined;
+              const engineMove = legalMoves.find((move) =>
+                move.from === from &&
+                move.to === to &&
+                (!move.promotion || move.promotion === promotion)
+              );
+
+              if (engineMove) selectedMove = engineMove;
+            }
+          } catch {
+            // Use the legal-move fallback when the WebAssembly engine is unavailable.
           }
-          setIsThinking(false);
-          return;
         }
 
-        const fen = currentGame.fen();
-        const bestMoveUCI = window.Module.ccall('get_best_move_wasm', 'string', ['string'], [fen]);
+        const gameCopy = new Chess(currentGame.fen());
+        const moveResult = gameCopy.move(selectedMove);
 
-        if (bestMoveUCI && bestMoveUCI.length >= 4) {
-          const from = bestMoveUCI.substring(0, 2);
-          const to = bestMoveUCI.substring(2, 4);
-          const promotion = bestMoveUCI.length > 4 ? bestMoveUCI[4] : 'q';
-
-          const gameCopy = new Chess(currentGame.fen());
-          const moveResult = gameCopy.move({ from, to, promotion });
-
-          if (moveResult) {
-            setGame(gameCopy);
-            updateMoveHistory(moveResult.san);
-            updateGameStatus(gameCopy);
-          }
+        if (moveResult) {
+          setGame(gameCopy);
+          updateMoveHistory(moveResult.san);
+          updateGameStatus(gameCopy);
         }
       } catch (err) {
         console.error("AI execution error:", err);
       } finally {
+        aiMoveTimeoutRef.current = null;
+        isThinkingRef.current = false;
         setIsThinking(false);
       }
     }, 50);
   }, [updateGameStatus, updateMoveHistory]);
 
   const applyPlayerMove = useCallback((from, to) => {
-    if (isThinking || game.isGameOver() || !from || !to) return false;
+    if (isThinking || isThinkingRef.current || game.isGameOver() || !from || !to) return false;
 
     const gameCopy = new Chess(game.fen());
     try {
@@ -253,6 +266,12 @@ export default function ChessGame() {
   }, []);
 
   const handleReset = useCallback(() => {
+    if (aiMoveTimeoutRef.current !== null) {
+      window.clearTimeout(aiMoveTimeoutRef.current);
+      aiMoveTimeoutRef.current = null;
+    }
+
+    isThinkingRef.current = false;
     setGame(new Chess());
     setMoveHistory([]);
     setGameStatus("White to move");

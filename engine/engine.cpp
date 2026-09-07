@@ -184,7 +184,7 @@ struct Board {
         int counter = 0;
         while (ss >> token) {
             counter++;
-            if (counter == 4) {
+            if (counter == 5) {
                 try { fullmove_number = std::stoi(token); } catch (...) { fullmove_number = 5; }
             }
         }
@@ -380,6 +380,14 @@ void generate_moves(const Board& b, std::vector<Move>& move_list, bool captures_
 bool make_move(Board& b, const Move& m, int& captured_piece) {
     captured_piece = b.squares[m.to];
     int moving_piece = b.squares[m.from];
+
+    if (moving_piece == EMPTY || get_piece_color(moving_piece) != b.side_to_move) {
+        return false;
+    }
+
+    if (captured_piece != EMPTY && get_piece_color(captured_piece) == b.side_to_move) {
+        return false;
+    }
 
     b.squares[m.from] = EMPTY;
     b.squares[m.to] = (m.promo != EMPTY) ? m.promo : moving_piece;
